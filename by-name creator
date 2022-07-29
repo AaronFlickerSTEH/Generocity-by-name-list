@@ -1,0 +1,314 @@
+library(tidyverse)
+library(lubridate)
+library(readxl)
+library(openxlsx)
+
+perms <- c("Owned by client, no ongoing housing subsidy", "Permanent housing (other than RRH) for formerly homeless persons",
+           "Rental by client in a public housing unit", "Rental by client, no ongoing housing subsidy", 
+           "Rental by client, with GPD TIP housing subsidy", "Rental by client, with other ongoing housing subsidy",
+           "Rental by client, with RRH or equivalent subsidy", "Residential project or halfway house with no homeless criteria",
+           "Staying or living with family, permanent tenure", "Staying or living with friends, permanent tenure",
+           "Moved from one HOPWA funded project to HOPWA PH", "Owned by client, with ongoing subsidy", "Rental by client, with VASH housing subsidy",
+           "Rental by client, with HCV voucher (tenant or project based)")
+exclude <- c("Hospital or other residential non-psychiatric medical facility", "Deceased", "Jail, prison, or juvenile detention facility")
+positives <- c("Emergency shelter, including hotel or motel paid for with emergency shelter voucher, or RHY-funded Host Home shelter",
+               "Hotel or motel paid for without emergency shelter voucher",  "Moved from one HOPWA  funded project to HOPWA TH", 
+               "Psychiatric hospital or other psychiatric facility", "Safe Haven", "Substance abuse treatment facility or detox center",
+               "Staying or living with family, temporary tenure (e.g. room, apartment or house)",
+               "Staying or living with friends, temporary tenure (e.g. room, apartment or house)",  
+               "Home Home (non-crisis)", "Transitional housing for homeless persons (including homeless youth)",
+               "Foster care home or foster care group home", "Long-term care facility or nursing home")
+setwd("C:/Users/aflicker/Strategies To End Homelessness, Inc/CommonFiles - CommonFiles/CONTINUUM OF CARE FILES/Data Analysis/Built for Zero/By name list")
+
+### Read in list of Generocity513 client enrollments
+generocity <- read.csv("generocity.csv", col.names = c("PersonalID", "FirstName", "LastName", "SSN4", "HHType", "Age", "Veteran", "Active", "Engagement", 
+                                                       "Entry", "Exit", "ChronicHealth", "Developmental", "HIV", "Mental", "Physical", "Substance", 
+                                                       "Destination", "Race", "Ethnicity")) %>%
+  mutate(Entry = ymd(Entry),
+         Exit = ymd(Exit),
+         Engagement = as.Date(Engagement))
+
+### Read in list of all homeless enrollments
+hl <- read.csv("homeless.csv", col.names = c("PersonalID", "EnrollmentID", "Program", "Entry", "Exit", "Housed")) %>%
+  mutate(Entry = ymd(Entry),
+         Exit = ymd(Exit))
+
+### Read in list of VI-SPDAT scores
+vispdat <- read.csv("vispdat.csv", col.names = c("PersonalID", "VIType", "VIDate", "VIScore"), 
+                    colClasses = c(rep("character", 2), "Date", "numeric"))
+
+### Read in coordinated entry match list
+matches20 <- read_excel("C:/Users/aflicker/Strategies To End Homelessness, Inc/CommonFiles - CommonFiles/Coordinated Entry/Match Tracking/July 2020 - June 2021 Housing Match Tracking Sheet.xlsx")[c(1, 10, 17, 20)]
+matches21 <- read_excel("C:/Users/aflicker/Strategies To End Homelessness, Inc/CommonFiles - CommonFiles/Coordinated Entry/Match Tracking/July 2021 - June 2022 Housing Match Tracking Sheet.xlsx",
+                        col_types = c("text", rep("skip", 8), "text", rep("skip", 5), "date", "date", "skip", "skip", "text", rep("skip", 14)))
+colnames(matches20) <- c("PublicID", "MatchedProject", "MatchDate", "Closed")
+colnames(matches21) <- c("PublicID", "MatchedProject", "PreMatch", "MatchDate", "Closed")
+
+### Set match date to pre-match date for site-based projects
+matches21$MatchDate[is.na(matches21$MatchDate)] <- matches21$PreMatch[is.na(matches21$MatchDate)]
+matches21$PreMatch <- NULL
+matches <- rbind(matches20, matches21) %>%
+  mutate(PublicID = str_remove(PublicID, " "))
+
+### Select the most recent match for each client
+matches2 <- matches %>%
+  group_by(PublicID) %>%
+  summarise(MatchDate = max(MatchDate)) %>%
+  inner_join(matches) %>%
+  unique()
+
+### Read in list of all active enrollments
+active <- read.csv("active.csv", col.names = c("PersonalID", "ProgramType", "EnrollmentID", "Program", "Entry", "MoveIn")) %>%
+  mutate(Entry = ymd(Entry),
+         MoveIn = ymd(MoveIn))
+
+### Read in list of Generocity encounters
+services <- read.csv("services.csv", col.names = c("PersonalID", "Service", "ServiceDate"), colClasses = c(rep("character", 2), "Date"))
+
+## Determine disability status and Public ID of Generocity clients
+generocity2 <- generocity %>%
+  mutate(Disability = ifelse(ChronicHealth == "Yes" | Developmental == "Yes" | HIV == "Yes" | Mental == "Yes" | Physical == "Yes" | 
+                               Substance == "Yes", "Yes", "No"),
+         PublicID = paste(FirstName, SSN4, sep = "")) %>%
+  filter(is.na(Exit) | Exit >= Entry) %>%
+  select(PersonalID:Exit, Destination:PublicID)
+
+## Select most recent Generocity entry for each client
+generocity3 <- generocity2 %>%
+  group_by(PersonalID) %>%
+  summarise(Entry = max(Entry)) %>%
+  inner_join(generocity2) %>%
+  mutate(ExitPriority = ifelse(is.na(Exit), 1, 0))
+
+generocity4 <- generocity3 %>%
+  group_by(PersonalID) %>%
+  summarise(ExitPriority = max(ExitPriority)) %>%
+  inner_join(generocity3) %>%
+  select(-ExitPriority)
+
+generocity5 <- generocity4 %>%
+  group_by(PersonalID) %>%
+  summarise(Exit = max(Exit)) %>%
+  inner_join(generocity4)
+
+## Determine which clients had an earlier Generocity entry and what their exit destination was
+priors <- anti_join(generocity2, generocity5) %>%
+  mutate(Housed = ifelse(Destination %in% perms, "Yes", "No")) %>%
+  select(PersonalID, Entry, Exit, Housed)
+  
+generocity6 <- left_join(generocity5, priors, by = "PersonalID") %>%
+  mutate(Return = ifelse(is.na(Exit.y) | Exit.y >= Entry.x, "No",
+                         ifelse(Housed == "Yes", "From housing", "From inactive"))) %>%
+  rename(Entry = Entry.x,
+         Exit = Exit.x) %>%
+  select(PersonalID:PublicID, Return)
+
+## Merge in most recent contact date for each client
+generocity7 <- services %>%
+  group_by(PersonalID) %>%
+  summarise(LastContact = max(ServiceDate)) %>%
+  right_join(generocity6)
+
+## Merge in VI-SPDAT scores
+generocity8 <- vispdat %>%
+  select(PersonalID, VIScore, VIDate) %>%
+  right_join(generocity7) %>%
+  mutate(DaysToAssess = VIDate-Entry,
+         DaysToAssess = ifelse(DaysToAssess < 0, NA, DaysToAssess))
+
+## Merge in housing matches and determine whether matches remain open
+generocity9 <- left_join(generocity8, matches2) %>%
+  mutate(MatchDate = ymd(MatchDate),
+         DaysToMatch = ifelse(is.na(DaysToAssess), as.numeric(MatchDate-Entry), as.numeric(MatchDate-VIDate)),
+         DaysToMatch = ifelse(DaysToMatch < 0, NA, DaysToMatch))
+
+## Add in any active shelter stays
+shelter <- active %>%
+  filter(ProgramType %in% c("Emergency Shelter", "Safe Haven"),
+         Program %in% c("[DEMO] Demo Emergency Shelter", "ESG-CV TRP") == FALSE)
+
+generocity10 <- shelter %>%
+  group_by(PersonalID) %>%
+  summarise(Entry = max(Entry)) %>%
+  inner_join(shelter) %>%
+  rename(Shelter = Program) %>%
+  select(PersonalID, Shelter) %>%
+  right_join(generocity9)
+
+## Create list of active clients to check for chronicity
+activepeeps <- generocity10$PersonalID[generocity10$Active == "Yes" & generocity10$Entry < today()]
+
+## Check for chronicity for each client
+## Create a data frame of dates of homelessness for each generocity client
+forch <- hl %>%
+  select(PersonalID, Entry, Exit) %>%
+  filter(PersonalID %in% activepeeps,
+         Exit > Entry | is.na(Exit),
+         Entry < today())
+forch$Exit[is.na(forch$Exit)] <- today()
+
+## Create a list of the last 365 dates
+last365 <- seq.Date(today(), by = "-1 days", length.out = 365)
+
+## Create a list of the last 1095 days
+last1095 <- seq.Date(today(), by = "-1 days", length.out = 1095)
+
+## Set up a vector to contain the IDs of chronic clients
+chpeeps <- NA
+
+for (i in 1:length(activepeeps)){
+  
+  ## Select client's homeless enrollments
+  dateframe <- filter(forch, PersonalID == activepeeps[i])
+  
+  ## Create a sequence of dates comprising the first enrollment on the list
+  hldates <- seq.Date(dateframe$Entry[1], dateframe$Exit[1], "days")
+  
+  ## Add all other dates of enrollment to the sequence
+  if (nrow(dateframe) > 1){
+    for (j in 2:nrow(dateframe)){
+      hldates <<- append(hldates, seq.Date(dateframe$Entry[j], dateframe$Exit[j], "days"))
+    }
+  }
+  
+  ## Sort and unduplicate the sequence of dates
+  hldates <- sort(unique(hldates[hldates %in% last1095]))
+  
+  ## If list contains fewer than 365 dates, client cannot be chronic
+  if (length(hldates) >= 365){
+    if (sum(last365 %in% hldates) == 365){
+  
+      ## If date list includes at least the last 365 consecutive dates, client is chronic
+      chpeeps <<- append(chpeeps, activepeeps[i])
+    }else{
+      
+      ## Otherwise, create a list of all dates since client's first date of homelessness
+      alldates <- seq.Date(min(hldates), today(), "days")
+      
+      ## Create a Boolean vector of whether client was homeless on each of those dates
+      dateshl <- alldates %in% hldates
+      
+      ## Create a table of lengths of each Boolean sequence
+      seql <- rle(dateshl)
+      
+      ## If there are at least 6 distinct Boolean sequences and 365 days of homelessness within last 1095, client is chronic
+      if (length(seql$lengths) > 6){
+        if (sum(last1095 %in% hldates) >= 365){
+          chpeeps <<- append(chpeeps, activepeeps[i])
+        }
+      }
+    }
+  }
+}
+chpeeps <- chpeeps[!is.na(chpeeps)]
+
+## Create vector of non-chronic clients to determine their dates of chronicity
+nonchpeeps <- activepeeps[activepeeps %in% chpeeps == FALSE]
+
+## Create a data frame to store the results
+chdateframe <- data.frame(PersonalID = NA,
+                          CHDate = as.Date(NA))
+
+for (k in 1:length(nonchpeeps)){
+  ## Create a vector to store the client's date of chronicity
+  chdate <- as.Date(NA)
+  
+  ## Select client's homeless enrollments
+  dateframe <- filter(forch, PersonalID == nonchpeeps[k])
+  
+  ## Create a sequence of dates comprising the first enrollment on the list
+  hldates <- seq.Date(dateframe$Entry[1], dateframe$Exit[1], "days")
+  
+  ## Add all other dates of enrollment to the sequence
+  if (nrow(dateframe) > 1){
+    for (j in 2:nrow(dateframe)){
+      hldates <<- append(hldates, seq.Date(dateframe$Entry[j], dateframe$Exit[j], "days"))
+    }
+  }
+  
+  ## Sort and unduplicate the sequence of dates
+  hldates <- sort(unique(hldates[hldates >= today()-1095]))
+  
+  #last1095 <- seq.Date(max(hldates), by = "-1 days", length.out = 1095)
+  
+  while (length(hldates) < 365){
+    
+    ## If client has been homeless for less than 365 days, add future dates to the sequence until it reaches a length of 365
+    hldates <- append(hldates, seq.Date(max(hldates)+1, by = "days", length.out = 365-length(hldates)))
+    
+    ## Count back 1095 days from the end of the previous sequence
+    last1095 <- seq.Date(max(hldates), by = "-1 days", length.out = 1095) 
+    
+    ## Limit the dates of homelessness to those in the 1095-day window
+    hldates <- hldates[hldates >= min(last1095)]
+  }
+  
+  ## Create a vector of all dates from the first date of homelessness to the last
+  alldates <- seq.Date(min(hldates), max(hldates), "days")
+  
+  ## Create a Boolean vector of whether the client was homeless on each of those dates
+  dateshl <- alldates %in% hldates
+  
+  ## Create a table of lengths of each sequence of Boolean values
+  seql <- rle(dateshl)
+  
+  if (sum(seql$values) < 4){
+    ## If client does not have 3 stints of homelessness, chronicity date is when 365 consecutive dates will be reached
+    chdate <- max(hldates)+365-seql$lengths[length(seql$lengths)]
+  }else{
+    ## If client has at least 3 stints of homelessness, chronicity date is when 365 total days will be reached
+    chdate <- max(hldates)
+  }
+  
+  ## Add the client's ID and chronicity date to the data frame
+  tempframe <- data.frame(PersonalID = nonchpeeps[k],
+                          CHDate = chdate)
+  chdateframe <<- rbind(tempframe, chdateframe)
+}
+
+##Add chronic status and dates to list
+generocity11 <- chdateframe %>%
+  filter(!is.na(PersonalID)) %>%
+  right_join(generocity10) %>%
+  mutate(CH = ifelse(PersonalID %in% chpeeps, "Yes", "No"))
+
+##Merge in housing entries
+housed <- filter(active, ProgramType %in% c("PH - Permanent Supportive Housing (disability required for entry)", "PH - Rapid Re-Housing", 
+                                                  "Transitional Housing", "PH - Housing Only")) %>%
+  mutate(TypePriority = ifelse(ProgramType == "PH - Permanent Supportive Housing (disability required for entry)", 2,
+                               ifelse(ProgramType == "PH - Rapid Re-Housing", 1, 0)))
+
+housed2 <- housed %>%
+  group_by(PersonalID) %>%
+  summarise(TypePriority = max(TypePriority)) %>%
+  inner_join(housed) %>%
+  mutate(MoveInPriority = ifelse(is.na(MoveIn), 0, 1))
+
+housed3 <- housed2 %>%
+  group_by(PersonalID) %>%
+  summarise(MoveInPriority = max(MoveInPriority)) %>%
+  inner_join(housed2)
+
+housed4 <- housed3 %>%
+  group_by(PersonalID) %>%
+  summarise(Entry = max(Entry)) %>%
+  inner_join(housed3) %>%
+  select(PersonalID, ProgramType, Program, MoveIn)
+
+generocity12 <- unique(housed4) %>%
+  right_join(generocity11) %>%
+  rename(HousingProgram = Program) %>%
+  mutate(DaysToMove = as.numeric(MoveIn-MatchDate),
+         HousingBucket = ifelse(Active == "No",
+                                ifelse(!is.na(MoveIn) | Destination %in% perms, "Housed", "Inactive"),
+                                ifelse(!is.na(MoveIn), "Housed",
+                                       ifelse(!is.na(HousingProgram) | (!is.na(MatchedProject) & is.na(Closed)), "Matched",
+                                              ifelse(is.na(VIScore), "Needs assessment", "Assessed")))),
+         Location = ifelse(HousingBucket == "Housed", "Housed",
+                           ifelse(ProgramType == "Transitional Housing" & !is.na(ProgramType), "Transitional Housing",
+                                  ifelse(!is.na(Shelter), "Emergency shelter",
+                                         ifelse(Active == "Yes", "On street", "Inactive")))),
+         MatchedProject = ifelse(!is.na(MoveIn), NA, MatchedProject),
+         MatchOpen = ifelse(HousingBucket == "Matched", "Yes", "No")) %>%
+  select(PersonalID, Entry, FirstName:Veteran, Race, Ethnicity, CH, CHDate, Location, Engagement, Exit, VIScore, DaysToAssess, Disability, MatchedProject, 
+         MatchDate, DaysToMatch, HousingProgram, MoveIn, DaysToMove, MatchOpen, Shelter, HousingBucket)
